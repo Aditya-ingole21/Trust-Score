@@ -1,0 +1,13 @@
+node_modules
+.env
+.env.local
+.env.*
+.vscode
+dist
+out
+.DS_Store
+
+# Foundry
+broadcast
+cache
+forge-artifacts
