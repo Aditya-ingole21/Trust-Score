@@ -3,3 +3,65 @@ body {
   background: black;
   color: white;
 }
+
+/* Body + background */
+:root {
+  --accent-start: #ff5a00;
+  --accent-mid: #ffb400;
+  --accent-end: #ffd34d;
+}
+
+html,body,#root {
+  height: 100%;
+}
+
+body {
+  font-family: Inter, ui-sans-serif, system-ui;
+  background-color: #070606;
+  color: #fff;
+}
+
+/* subtle vignette using your uploaded screenshot as texture (local dev) */
+.app-bg {
+  background-image:
+    radial-gradient(ellipse at 10% 20%, rgba(255,120,40,0.06) 0%, transparent 18%),
+    linear-gradient(180deg, rgba(0,0,0,0.85), rgba(0,0,0,0.95)),
+    url('/mnt/data/Screenshot 2025-11-23 125202.png'); /* local image used as texture */
+  background-size: cover;
+  background-blend-mode: overlay;
+}
+
+/* Gradient headline */
+.headline-gradient {
+  background: linear-gradient(90deg, var(--accent-start), var(--accent-mid), var(--accent-end));
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+/* Glow text for big accent word */
+.glow-accent {
+  text-shadow:
+    0 1px 0 rgba(255,255,255,0.02),
+    0 6px 30px rgba(255,120,40,0.18);
+}
+
+/* Panel */
+.panel {
+  background: linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.01));
+  border: 1px solid rgba(255,255,255,0.03);
+  box-shadow: 0 8px 40px rgba(0,0,0,0.6);
+}
+
+/* small utilities */
+.muted { color: #9aa0a6; font-size: 0.9rem; }
+.badge {
+  display:inline-block;
+  padding:0.25rem 0.6rem;
+  background: linear-gradient(90deg,#ffb40020,#ff5a000b);
+  color:var(--accent-mid);
+  border-radius:6px;
+  font-weight:600;
+  font-size:0.8rem;
+  border: 1px solid rgba(255,255,255,0.03);
+}
