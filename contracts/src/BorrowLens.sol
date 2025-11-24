@@ -13,15 +13,19 @@ contract BorrowLens {
 
     function oneClickBorrow(
         address user,
+        address collateralToken,
         uint256 collateralAmount,
-        uint256 borrowAmount,
-        bytes memory signature
+        uint256 borrowAmountUsd,
+        bytes memory signature,
+        uint8 aggregatorDecimals
     ) external returns (bool) {
         return market.verifyAndBorrow(
             user,
+            collateralToken,
             collateralAmount,
-            borrowAmount,
-            signature
+            borrowAmountUsd,
+            signature,
+            aggregatorDecimals
         );
     }
 }
