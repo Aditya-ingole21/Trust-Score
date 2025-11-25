@@ -4,11 +4,9 @@ pragma solidity ^0.8.20;
 import { Ownable } from "@openzeppelin/contracts/access/Ownable.sol";
 import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
-import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import { ReentrancyGuard } from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import { TrustScoreOracle } from "./TrustScoreOracle.sol";
 import "chainlink-brownie-contracts/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol";
-
-
 
 /// @notice TrustScoreMarket — accepts collateral (WETH / cbBTC) and mints/returns USDC (requires USDC liquidity seeded).
 /// - Uses TrustScoreOracle for on-chain score verification
@@ -24,27 +22,10 @@ contract TrustScoreMarket is Ownable(msg.sender), ReentrancyGuard {
     address public cbBTC;
 
     // Chainlink aggregator addresses mapped by token
-    mapping(address => address) public priceFeed; // token => aggregator
-    mapping(address => uint8) public tokenDecimals;
-    mapping(address => AggregatorV3Interface) public priceFeeds;
- // token => decimals (ERC20 decimals)
- function setPriceFeed(address token, address feed) external onlyOwner {
-    priceFeeds[token] = AggregatorV3Interface(feed);
-}
-
-function setTokenDecimals(address token, uint8 decimals_) external onlyOwner {
-    tokenDecimals[token] = decimals_;
-}
-function getPrice(address token) public view returns (uint256) {
-    AggregatorV3Interface feed = priceFeeds[token];
-    require(address(feed) != address(0), "No price feed");
-
-    (, int256 price,,,) = feed.latestRoundData();
-    require(price > 0, "Invalid price");
-
-    return uint256(price); // already 8 decimals
-}
-
+    mapping(address => address) public priceFeed; // token => aggregator address
+    mapping(address => AggregatorV3Interface) public priceFeeds; // token => AggregatorV3Interface
+    mapping(address => uint8) public aggregatorDecimals; // token => aggregator decimals
+    mapping(address => uint8) public tokenDecimals; // token => token decimals (ERC20 decimals)
 
     // LTV rules
     struct LTVBracket {
@@ -98,16 +79,37 @@ function getPrice(address token) public view returns (uint256) {
         emit AssetsConfigured(_usdc, _weth, _cbbtc);
     }
 
-    
-
     /// @notice Set Chainlink price feed for a token (aggregator that returns price with aggregatorDecimals)
-    function setPriceFeed(address token, address aggregator, uint8 aggregatorDecimals) external onlyOwner {
+    function setPriceFeed(address token, address aggregator, uint8 _aggregatorDecimals) external onlyOwner {
+        require(token != address(0), "token zero");
+        require(aggregator != address(0), "aggregator zero");
+
         priceFeed[token] = aggregator;
-        tokenDecimals[token] = tokenDecimals[token] == 0 ? 18 : tokenDecimals[token]; // keep existing or default
-        emit PriceFeedSet(token, aggregator, aggregatorDecimals);
+        priceFeeds[token] = AggregatorV3Interface(aggregator);
+        aggregatorDecimals[token] = _aggregatorDecimals;
+
+        // keep tokenDecimals existing or default to 18 (owner can explicitly set via setTokenDecimals)
+        if (tokenDecimals[token] == 0) {
+            tokenDecimals[token] = 18;
+        }
+
+        emit PriceFeedSet(token, aggregator, _aggregatorDecimals);
+    }
+
+    function setTokenDecimals(address token, uint8 decimals_) external onlyOwner {
+        require(token != address(0), "token zero");
+        tokenDecimals[token] = decimals_;
     }
 
     /* ========== VIEW HELPERS ========== */
+
+    function getPrice(address token) public view returns (uint256) {
+        AggregatorV3Interface feed = priceFeeds[token];
+        require(address(feed) != address(0), "No price feed");
+        (, int256 price,,,) = feed.latestRoundData();
+        require(price > 0, "Invalid price");
+        return uint256(price);
+    }
 
     function getMaxLTV(uint256 score) public view returns (uint256) {
         for (uint256 i = 0; i < brackets.length; i++) {
@@ -121,29 +123,32 @@ function getPrice(address token) public view returns (uint256) {
     /// @notice Compute collateral USD value (returns USDC units, 6 decimals).
     /// @param token collateral token address
     /// @param amount raw token amount (token decimals as in tokenDecimals[token])
-    /// @param aggregatorDecimals decimals of the price feed (e.g. 8)
-    function getCollateralUsdValueInUSDC(address token, uint256 amount, uint8 aggregatorDecimals) public view returns (uint256 usdInUSDC6) {
-        address agg = priceFeed[token];
-        require(agg != address(0), "missing price feed");
+    /// @param _aggregatorDecimals decimals of the price feed (e.g. 8). If zero, falls back to stored aggregatorDecimals[token].
+    function getCollateralUsdValueInUSDC(address token, uint256 amount, uint8 _aggregatorDecimals) public view returns (uint256 usdInUSDC6) {
+        address aggAddr = priceFeed[token];
+        require(aggAddr != address(0), "missing price feed");
 
-        // Call aggregator.latestRoundData()
-        (bool ok, bytes memory out) = agg.staticcall(abi.encodeWithSignature("latestRoundData()"));
-        require(ok && out.length >= 32, "bad agg call");
+        AggregatorV3Interface feed = priceFeeds[token];
+        require(address(feed) != address(0), "missing feed instance");
 
-        // decode: (uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound)
-        (, int256 answer, , , ) = abi.decode(out, (uint80, int256, uint256, uint256, uint80));
+        // read latestRoundData() from aggregator
+        (, int256 answer, , , ) = feed.latestRoundData();
         require(answer > 0, "invalid price");
 
-        uint256 price = uint256(answer); // price with aggregatorDecimals
+        uint256 price = uint256(answer);
 
         uint8 tDecimals = tokenDecimals[token];
         if (tDecimals == 0) {
-            tDecimals = 18; // default
+            tDecimals = 18;
         }
 
+        uint8 aDecimals = _aggregatorDecimals != 0 ? _aggregatorDecimals : aggregatorDecimals[token];
+        require(aDecimals > 0, "aggregator decimals not set");
+
         // collateralUsdUSDC6 = amount * price * 1e6 / (10**aggregatorDecimals) / (10**tDecimals)
+        // compute with intermediate 256-bit to avoid overflow in normal ranges (caller should ensure sensible amounts)
         uint256 numerator = amount * price * 1e6;
-        uint256 denom = (10 ** uint256(aggregatorDecimals)) * (10 ** uint256(tDecimals));
+        uint256 denom = (10 ** uint256(aDecimals)) * (10 ** uint256(tDecimals));
         usdInUSDC6 = numerator / denom;
     }
 
@@ -155,17 +160,20 @@ function getPrice(address token) public view returns (uint256) {
     /// @param collateralAmount raw token units (must be approved)
     /// @param borrowAmountUsd amount of USDC to borrow (USDC units = 6 decimals)
     /// @param signature signature verifying score (used via oracle.verifyScore)
-    /// @param aggregatorDecimals decimals for the price feed being used
+    /// @param aggregatorDecimals decimals for the price feed being used (if 0, uses stored aggregatorDecimals)
     function verifyAndBorrow(
         address user,
         address collateralToken,
         uint256 collateralAmount,
         uint256 borrowAmountUsd,
         bytes memory signature,
-        uint8 aggregatorDecimals
+        uint8 aggregatorDecimals_
     ) external nonReentrant returns (bool) {
 
         // 1. Verify backend signature -> sets lastScore for user inside oracle
+        // NOTE: your oracle.verifyScore expects (user, score, signature). Current code passes oracle.lastScore(user) as the score param.
+        // That means this call re-verifies the existing stored score with the provided signature.
+        // If you want to pass a NEW score carried in the signature, change this function to accept `uint256 score` and forward it.
         oracle.verifyScore(user, oracle.lastScore(user), signature);
 
         // 2. get score & LTV
@@ -175,10 +183,11 @@ function getPrice(address token) public view returns (uint256) {
         uint256 maxLtv = getMaxLTV(score); // percent
 
         // 3. compute required collateral in USD (USDC 6 decimals)
+        // requiredCollateralUsd = ceil(borrowAmountUsd / (maxLtv / 100))
         uint256 requiredCollateralUsd = (borrowAmountUsd * 100 + (maxLtv - 1)) / maxLtv; // ceil-ish
 
         // 4. compute actual collateral USD value
-        uint256 collateralUsdValue = getCollateralUsdValueInUSDC(collateralToken, collateralAmount, aggregatorDecimals);
+        uint256 collateralUsdValue = getCollateralUsdValueInUSDC(collateralToken, collateralAmount, aggregatorDecimals_);
 
         require(collateralUsdValue >= requiredCollateralUsd, "Not enough collateral USD value");
 
