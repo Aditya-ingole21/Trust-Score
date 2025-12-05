@@ -2,12 +2,20 @@
 pragma solidity ^0.8.20;
 
 import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
-import "@openzeppelin/contracts/access/Ownable.sol";
 
-contract TestUSDC is ERC20, Ownable {
-    constructor() ERC20("Test USDC", "tUSDC") Ownable(msg.sender) {}
+contract TestUSDC is ERC20 {
+    uint8 private _decimals;
 
-    function mint(address to, uint256 amount) external onlyOwner {
+    constructor() ERC20("Test USDC", "tUSDC") {
+        _decimals = 6;
+    }
+
+    /// @notice Mint freely in tests (no onlyOwner) so tests can allocate tokens easily.
+    function mint(address to, uint256 amount) external {
         _mint(to, amount);
+    }
+
+    function decimals() public view virtual override returns (uint8) {
+        return _decimals;
     }
 }

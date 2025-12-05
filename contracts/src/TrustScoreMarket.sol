@@ -8,10 +8,7 @@ import { ReentrancyGuard } from "@openzeppelin/contracts/utils/ReentrancyGuard.s
 import { TrustScoreOracle } from "./TrustScoreOracle.sol";
 import "chainlink-brownie-contracts/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol";
 
-/// @notice TrustScoreMarket — accepts collateral (WETH / cbBTC) and mints/returns USDC (requires USDC liquidity seeded).
-/// - Uses TrustScoreOracle for on-chain score verification
-/// - Uses Chainlink price feeds to convert collateral -> USD value (owner config)
-contract TrustScoreMarket is Ownable(msg.sender), ReentrancyGuard {
+contract TrustScoreMarket is Ownable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
     TrustScoreOracle public oracle;
@@ -47,11 +44,12 @@ contract TrustScoreMarket is Ownable(msg.sender), ReentrancyGuard {
     event CollateralWithdrawn(address indexed user, address collateralToken, uint256 collateralAmount);
     event AssetsConfigured(address usdc, address weth, address cbbtc);
     event PriceFeedSet(address token, address aggregator, uint8 decimals);
+    event LiquidationExecuted(address indexed user, address indexed liquidator, uint256 repayUsd, uint256 collateralSeized);
 
-    constructor(address _oracle, address _usdc, address _weth, address _cbbtc) {
+    constructor(address _oracle, address _usdc, address _weth, address _cbbtc) Ownable(msg.sender) {
         oracle = TrustScoreOracle(_oracle);
 
-        // EXACT LAUNCH TABLE
+        // EXACT LAUNCH TABLE (minScore, maxScore, maxLTV)
         brackets.push(LTVBracket(95, 100, 97));
         brackets.push(LTVBracket(90, 94, 95));
         brackets.push(LTVBracket(85, 89, 90));
@@ -123,7 +121,7 @@ contract TrustScoreMarket is Ownable(msg.sender), ReentrancyGuard {
     /// @notice Compute collateral USD value (returns USDC units, 6 decimals).
     /// @param token collateral token address
     /// @param amount raw token amount (token decimals as in tokenDecimals[token])
-    /// @param _aggregatorDecimals decimals of the price feed (e.g. 8). If zero, falls back to stored aggregatorDecimals[token].
+    /// @param _aggregatorDecimals decimals of the price feed (should come from aggregatorDecimals mapping)
     function getCollateralUsdValueInUSDC(address token, uint256 amount, uint8 _aggregatorDecimals) public view returns (uint256 usdInUSDC6) {
         address aggAddr = priceFeed[token];
         require(aggAddr != address(0), "missing price feed");
@@ -142,11 +140,10 @@ contract TrustScoreMarket is Ownable(msg.sender), ReentrancyGuard {
             tDecimals = 18;
         }
 
-        uint8 aDecimals = _aggregatorDecimals != 0 ? _aggregatorDecimals : aggregatorDecimals[token];
+        uint8 aDecimals = _aggregatorDecimals;
         require(aDecimals > 0, "aggregator decimals not set");
 
         // collateralUsdUSDC6 = amount * price * 1e6 / (10**aggregatorDecimals) / (10**tDecimals)
-        // compute with intermediate 256-bit to avoid overflow in normal ranges (caller should ensure sensible amounts)
         uint256 numerator = amount * price * 1e6;
         uint256 denom = (10 ** uint256(aDecimals)) * (10 ** uint256(tDecimals));
         usdInUSDC6 = numerator / denom;
@@ -154,55 +151,63 @@ contract TrustScoreMarket is Ownable(msg.sender), ReentrancyGuard {
 
     /* ========== CORE: verify + accept collateral + pay USDC ========== */
 
-    /// @notice verify signature, accept collateral, transfer USDC to borrower (requires USDC liquidity in contract)
-    /// @param user target user (score must be issued for this address)
-    /// @param collateralToken token used as collateral (WETH or cbBTC)
-    /// @param collateralAmount raw token units (must be approved)
-    /// @param borrowAmountUsd amount of USDC to borrow (USDC units = 6 decimals)
-    /// @param signature signature verifying score (used via oracle.verifyScore)
-    /// @param aggregatorDecimals decimals for the price feed being used (if 0, uses stored aggregatorDecimals)
+    /**
+     * @notice verify signature, accept collateral, transfer USDC to borrower (requires USDC liquidity in contract)
+     * @param user target user (score must be issued for this address)
+     * @param collateralFrom address that supplies collateral (should be the user in regular UX)
+     * @param collateralToken token used as collateral (WETH or cbBTC)
+     * @param collateralAmount raw token units (must be approved by collateralFrom)
+     * @param borrowAmountUsd amount of USDC to borrow (USDC units = 6 decimals)
+     * @param score signed trust score (0-100)
+     * @param timestamp timestamp embedded in signature (unix seconds)
+     * @param nonce monotonic nonce embedded in signature
+     * @param signature signature verifying score (EIP-712)
+     */
     function verifyAndBorrow(
         address user,
+        address collateralFrom,
         address collateralToken,
         uint256 collateralAmount,
         uint256 borrowAmountUsd,
-        bytes memory signature,
-        uint8 aggregatorDecimals_
+        uint8 score,
+        uint256 timestamp,
+        uint256 nonce,
+        bytes memory signature
     ) external nonReentrant returns (bool) {
 
-        // 1. Verify backend signature -> sets lastScore for user inside oracle
-        // NOTE: your oracle.verifyScore expects (user, score, signature). Current code passes oracle.lastScore(user) as the score param.
-        // That means this call re-verifies the existing stored score with the provided signature.
-        // If you want to pass a NEW score carried in the signature, change this function to accept `uint256 score` and forward it.
-        oracle.verifyScore(user, oracle.lastScore(user), signature);
+        // 0. Validate collateral token
+        require(collateralToken == WETH, "unsupported collateral");
 
-        // 2. get score & LTV
-        uint256 score = oracle.lastScore(user);
-        require(score > 0, "No score found");
 
+        // 1) Verify backend signature (this updates oracle.lastScore for the user)
+        oracle.verifyScore(user, score, timestamp, nonce, signature);
+
+        // 2) get score & LTV
         uint256 maxLtv = getMaxLTV(score); // percent
 
-        // 3. compute required collateral in USD (USDC 6 decimals)
-        // requiredCollateralUsd = ceil(borrowAmountUsd / (maxLtv / 100))
+        // 3) compute required collateral in USD (USDC 6 decimals).
+        require(maxLtv > 0, "invalid ltv");
         uint256 requiredCollateralUsd = (borrowAmountUsd * 100 + (maxLtv - 1)) / maxLtv; // ceil-ish
 
-        // 4. compute actual collateral USD value
-        uint256 collateralUsdValue = getCollateralUsdValueInUSDC(collateralToken, collateralAmount, aggregatorDecimals_);
+        // 4) compute actual collateral USD value (use stored aggregatorDecimals)
+        uint8 aDecimals = aggregatorDecimals[collateralToken];
+        require(aDecimals > 0, "aggregator decimals not set");
+        uint256 collateralUsdValue = getCollateralUsdValueInUSDC(collateralToken, collateralAmount, aDecimals);
 
         require(collateralUsdValue >= requiredCollateralUsd, "Not enough collateral USD value");
 
-        // 5. take collateral from caller
-        IERC20(collateralToken).safeTransferFrom(msg.sender, address(this), collateralAmount);
+        // 5) take collateral from collateralFrom
+        IERC20(collateralToken).safeTransferFrom(collateralFrom, address(this), collateralAmount);
 
-        // 6. store/update position (simple overwrite model)
+        // 6) store/update position (simple overwrite model)
         positions[user] = Position({
             collateralToken: collateralToken,
             collateralAmount: collateralAmount,
             borrowUsd: borrowAmountUsd
         });
 
-        // 7. transfer USDC to borrower (requires contract to hold enough USDC)
-        IERC20(USDC).safeTransfer(msg.sender, borrowAmountUsd);
+        // 7) transfer USDC to user (requires contract to hold enough USDC)
+        IERC20(USDC).safeTransfer(user, borrowAmountUsd);
 
         emit BorrowExecuted(user, collateralToken, collateralAmount, borrowAmountUsd);
         return true;
@@ -233,6 +238,81 @@ contract TrustScoreMarket is Ownable(msg.sender), ReentrancyGuard {
 
         return true;
     }
+
+    /* ========== LIQUIDATION ========== */
+
+    /**
+     * @notice Minimal liquidation: anyone can call to repay a portion of debt and seize collateral at a bonus
+     * @param user borrower to liquidate
+     * @param repayUsd amount of USDC to pay (6 decimals), must be <= borrowUsd
+     */
+    function liquidate(address user, uint256 repayUsd) external nonReentrant {
+    Position memory pos = positions[user];
+    require(pos.borrowUsd > 0, "no position");
+    require(repayUsd > 0 && repayUsd <= pos.borrowUsd, "invalid repay amount");
+
+    uint8 aDecimals = aggregatorDecimals[pos.collateralToken];
+    require(aDecimals > 0, "aggregator decimals not set");
+
+    uint256 collateralUsd = getCollateralUsdValueInUSDC(
+        pos.collateralToken,
+        pos.collateralAmount,
+        aDecimals
+    );
+
+    uint8 score = oracle.getScore(user);
+    uint256 maxLtv = getMaxLTV(score);
+    uint256 requiredCollateralUsd =
+        (pos.borrowUsd * 100 + (maxLtv - 1)) / maxLtv;
+
+    require(collateralUsd < requiredCollateralUsd, "position healthy");
+
+    IERC20(USDC).safeTransferFrom(msg.sender, address(this), repayUsd);
+
+    uint256 bonusBP = 500; // 5% liquidation bonus
+    uint256 seizeUsd = (repayUsd * (10000 + bonusBP)) / 10000;
+
+    uint256 collateralToSeize =
+        (pos.collateralAmount * seizeUsd) / collateralUsd;
+
+    // ----------- SAFETY FIX -----------
+    if (collateralToSeize > pos.collateralAmount) {
+        collateralToSeize = pos.collateralAmount;
+    }
+    // ----------------------------------
+
+    // update debt
+    if (repayUsd >= pos.borrowUsd) {
+        positions[user].borrowUsd = 0;
+    } else {
+        positions[user].borrowUsd = pos.borrowUsd - repayUsd;
+    }
+
+    // update collateral
+    positions[user].collateralAmount =
+        pos.collateralAmount - collateralToSeize;
+
+    // fully remove position if empty
+    if (
+        positions[user].borrowUsd == 0 ||
+        positions[user].collateralAmount == 0
+    ) {
+        delete positions[user];
+    }
+
+    IERC20(pos.collateralToken).safeTransfer(
+        msg.sender,
+        collateralToSeize
+    );
+
+    emit LiquidationExecuted(
+        user,
+        msg.sender,
+        repayUsd,
+        collateralToSeize
+    );
+}
+
 
     /* ========== ADMIN UTILITIES ========== */
 

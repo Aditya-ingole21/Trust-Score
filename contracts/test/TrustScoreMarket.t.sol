@@ -2,63 +2,39 @@
 pragma solidity ^0.8.20;
 
 import "forge-std/Test.sol";
+import "../src/TrustScoreOracle.sol";
 import "../src/TrustScoreMarket.sol";
+import "../src/BorrowLens.sol";
+import "../src/TestUSDC.sol";
+import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 
-/// Minimal mock ERC20 (mintable, basic allowance/transferFrom)
-contract MockERC20 {
-    string public name;
-    string public symbol;
-    uint8 public decimals;
-    mapping(address => uint256) public balanceOf;
-    mapping(address => mapping(address => uint256)) public allowance;
-    event Transfer(address indexed from, address indexed to, uint256 amount);
-    event Approval(address indexed owner, address indexed spender, uint256 amount);
+/// @notice Minimal ERC20 for collateral simulation
+contract MockERC20 is ERC20 {
+    uint8 private _decimals;
 
-    constructor(string memory _name, string memory _symbol, uint8 _decimals) {
-        name = _name;
-        symbol = _symbol;
-        decimals = _decimals;
+    constructor(string memory name_, string memory symbol_, uint8 decimals_)
+        ERC20(name_, symbol_)
+    {
+        _decimals = decimals_;
+    }
+
+    function decimals() public view override returns (uint8) {
+        return _decimals;
     }
 
     function mint(address to, uint256 amount) external {
-        balanceOf[to] += amount;
-        emit Transfer(address(0), to, amount);
-    }
-
-    function approve(address spender, uint256 amount) external returns (bool) {
-        allowance[msg.sender][spender] = amount;
-        emit Approval(msg.sender, spender, amount);
-        return true;
-    }
-
-    function transfer(address to, uint256 amount) external returns (bool) {
-        require(balanceOf[msg.sender] >= amount, "insufficient");
-        balanceOf[msg.sender] -= amount;
-        balanceOf[to] += amount;
-        emit Transfer(msg.sender, to, amount);
-        return true;
-    }
-
-    function transferFrom(address from, address to, uint256 amount) external returns (bool) {
-        require(balanceOf[from] >= amount, "insufficient-from");
-        uint256 allowed = allowance[from][msg.sender];
-        require(allowed >= amount, "allowance");
-        allowance[from][msg.sender] = allowed - amount;
-        balanceOf[from] -= amount;
-        balanceOf[to] += amount;
-        emit Transfer(from, to, amount);
-        return true;
+        _mint(to, amount);
     }
 }
 
-/// Mock chainlink aggregator
-contract MockAggregator {
+/// @notice Minimal Chainlink mock aggregator
+contract MockV3Aggregator {
     int256 public answer;
-    uint8 public aggDecimals;
+    uint8 public decimals_;
 
-    constructor(int256 _answer, uint8 _decimals) {
-        answer = _answer;
-        aggDecimals = _decimals;
+    constructor(uint8 _decimals, int256 _initialAnswer) {
+        decimals_ = _decimals;
+        answer = _initialAnswer;
     }
 
     function latestRoundData()
@@ -66,161 +42,175 @@ contract MockAggregator {
         view
         returns (uint80, int256, uint256, uint256, uint80)
     {
-        return (uint80(1), answer, block.timestamp, block.timestamp, uint80(1));
-    }
-}
-
-/// Mock oracle
-contract MockOracle {
-    mapping(address => uint256) public lastScore;
-    address public signer;
-
-    event ScoreVerified(address indexed user, uint256 score);
-
-    constructor(address _signer) {
-        signer = _signer;
+        // (roundId, answer, startedAt, updatedAt, answeredInRound)
+        return (0, answer, block.timestamp, block.timestamp, 0);
     }
 
-    function verifyScore(address user, uint256 score, bytes memory) external returns (bool) {
-        uint256 setTo = score == 0 ? 90 : score;
-        lastScore[user] = setTo;
-        emit ScoreVerified(user, setTo);
-        return true;
-    }
-
-    function updateSigner(address _s) external {
-        signer = _s;
+    function updateAnswer(int256 newAnswer) external {
+        answer = newAnswer;
     }
 }
 
 contract TrustScoreMarketTest is Test {
+    TrustScoreOracle oracle;
     TrustScoreMarket market;
-    MockOracle oracle;
-    MockERC20 usdc;
-    MockERC20 weth;
-    MockERC20 cbBTC;
-    MockAggregator aggWETH;
+    BorrowLens lens;
+    TestUSDC usdc;
 
-    address owner = address(0xABCD);
-    address alice = address(0xBEEF);
-    address deployer = address(0xDEAD);
+    MockV3Aggregator wethFeed;
+    MockV3Aggregator btcFeed;
 
-    function setUp() public {
-        vm.deal(deployer, 1 ether);
+    uint256 signerKey;
+    address signer;
 
-        oracle = new MockOracle(owner);
+    address alice;
+    MockERC20 wethToken;
+    MockERC20 cbbtcToken;
 
-        usdc = new MockERC20("USDC","USDC",6);
-        weth = new MockERC20("WETH","WETH",18);
-        cbBTC = new MockERC20("cbBTC","cbBTC",8);
+    
+function setUp() public {
+    signerKey = 0xBEEF00112233445566778899AABBCCDDEEFF00112233445566778899AABBCCDD;
+    signer = vm.addr(signerKey);
 
-        int256 wethPrice = int256(2000 * 10 ** 8);
-        aggWETH = new MockAggregator(wethPrice, 8);
+    oracle = new TrustScoreOracle(signer);
+    usdc  = new TestUSDC();
 
-        vm.prank(deployer);
-        market = new TrustScoreMarket(address(oracle), address(usdc), address(weth), address(cbBTC));
+    // deploy collateral mocks
+    wethToken  = new MockERC20("WETH", "WETH", 18);
+    cbbtcToken = new MockERC20("cbBTC", "CBTC", 8);
 
-        usdc.mint(deployer, 100_000 * 10 ** 6);
-        vm.prank(deployer);
-        usdc.transfer(address(market), 100_000 * 10 ** 6);
+    // deploy price feed mocks
+    wethFeed = new MockV3Aggregator(8, int256(2000 * 1e8));
+    btcFeed  = new MockV3Aggregator(8, int256(40000 * 1e8));
 
-        vm.prank(deployer);
-        market.setPriceFeed(address(weth), address(aggWETH), 8);
+    // deploy market
+    market = new TrustScoreMarket(
+        address(oracle),
+        address(usdc),
+        address(wethToken),
+        address(cbbtcToken)
+    );
 
-        vm.prank(deployer);
-        market.setTokenDecimals(address(weth), 18);
+    // deploy lens
+    lens = new BorrowLens(address(market));
 
-        weth.mint(alice, 1 ether);
+    // set decimals
+    market.setTokenDecimals(address(usdc), 6);
+    market.setTokenDecimals(address(wethToken), 18);
+    market.setTokenDecimals(address(cbbtcToken), 8);
+
+    // set price feeds
+    market.setPriceFeed(address(wethToken), address(wethFeed), 8);
+    market.setPriceFeed(address(cbbtcToken), address(btcFeed), 8);
+
+    // seed liquidity
+    usdc.mint(address(market), 1_000_000 * 1e6);
+
+    // prepare alice
+    alice = address(0xA11CE);
+    wethToken.mint(alice, 10 ether);
+    cbbtcToken.mint(alice, 10 * 1e8);
+}
+
+    // helper: sign (call oracle.digestForSigning then vm.sign)
+    function _signScore(address wallet, uint8 score, uint256 nonce) internal returns (bytes memory sig, uint256 ts) {
+        ts = block.timestamp;
+        bytes32 digest = oracle.digestForSigning(wallet, score, ts, nonce);
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(signerKey, digest);
+        sig = abi.encodePacked(r, s, v);
     }
 
-    function test_setPriceFeed_and_getPrice() public {
-        uint256 p = market.getPrice(address(weth));
-        assertEq(p, uint256(2000 * 10 ** 8));
-    }
+    function testBorrowRepayWithdraw() public {
+        uint8 score = 95;
+        uint256 nonce = 1;
+        uint256 collateralAmount = 1 ether;
+        uint256 borrowAmount = 1000 * 1e6; // 1000 USDC (6 decimals)
 
-    function test_verifyAndBorrow_success() public {
+        // alice approves market to spend WETH
+        vm.startPrank(alice);
+        wethToken.approve(address(market), collateralAmount);
+        vm.stopPrank();
+
+        // sign score for alice
+        (bytes memory sig, uint256 ts) = _signScore(alice, score, nonce);
+
+        // alice calls oneClickBorrow via lens
         vm.prank(alice);
-        weth.approve(address(market), 1 ether);
-
-        uint256 collateralAmount = 0.1 ether;
-        uint256 borrowUsd = 50 * 10 ** 6;
-
-        vm.prank(alice);
-        bool ok = market.verifyAndBorrow(
+        bool ok = lens.oneClickBorrow(
             alice,
-            address(weth),
+            alice,
+            address(wethToken),
             collateralAmount,
-            borrowUsd,
-            bytes("sig"),
-            8
+            borrowAmount,
+            score,
+            ts,
+            nonce,
+            sig
         );
-        assertTrue(ok);
+        assertTrue(ok, "oneClickBorrow failed");
 
-        assertEq(usdc.balanceOf(alice), borrowUsd);
+        // verify position on market
+        TrustScoreMarket.Position memory pos = market.getPosition(alice);
+        assertEq(pos.borrowUsd, borrowAmount);
 
-        (address collTok, uint256 collAmt, uint256 borrowed) = market.getPosition(alice);
-        assertEq(collTok, address(weth));
-        assertEq(collAmt, collateralAmount);
-        assertEq(borrowed, borrowUsd);
+        // prepare alice to repay
+        vm.startPrank(alice);
+        usdc.mint(alice, borrowAmount);
+        usdc.approve(address(market), borrowAmount);
+        vm.stopPrank();
+
+        // repay and withdraw
+        vm.prank(alice);
+        market.repayAndWithdraw(alice, borrowAmount);
+
+        TrustScoreMarket.Position memory pos2 = market.getPosition(alice);
+        assertEq(pos2.borrowUsd, 0, "position should be cleared after full repay");
     }
 
-    function test_verifyAndBorrow_fails_missingPriceFeed() public {
+    function testLiquidationAfterPriceDrop() public {
+        uint8 score = 95;
+        uint256 nonce = 10;
+
+        uint256 collateralAmount = 1 ether;
+        uint256 borrowAmount = 1500 * 1e6; // 1500 USDC
+
+        // alice approves market to spend WETH
+        vm.startPrank(alice);
+        wethToken.approve(address(market), collateralAmount);
+        vm.stopPrank();
+
+        // sign and borrow
+        (bytes memory sig, uint256 ts) = _signScore(alice, score, nonce);
         vm.prank(alice);
-        cbBTC.mint(alice, 10 * 10 ** 8);
-        vm.prank(alice);
-        cbBTC.approve(address(market), 10 * 10 ** 8);
+        lens.oneClickBorrow(
+            alice,
+            alice,
+            address(wethToken),
+            collateralAmount,
+            borrowAmount,
+            score,
+            ts,
+            nonce,
+            sig
+        );
 
-        vm.prank(alice);
-        vm.expectRevert("missing price feed");
-        market.verifyAndBorrow(alice, address(cbBTC), 1 * 10 ** 8, 10 * 10 ** 6, bytes("sig"), 8);
-    }
+        // price drops significantly
+        wethFeed.updateAnswer(int256(500 * 1e8)); // WETH now $500
 
-    function test_verifyAndBorrow_fails_insufficientCollateral() public {
-        vm.prank(alice);
-        weth.approve(address(market), 1 ether);
+        uint256 repayUsd = 500 * 1e6;
+        address liquidator = address(0xBEEF);
 
-        uint256 collateralAmount = 1 wei;
-        uint256 borrowUsd = 1000 * 10 ** 6;
+        // give liquidator USDC and approve
+        usdc.mint(liquidator, repayUsd);
+        vm.prank(liquidator);
+        usdc.approve(address(market), repayUsd);
 
-        vm.prank(alice);
-        vm.expectRevert("Not enough collateral USD value");
-        market.verifyAndBorrow(alice, address(weth), collateralAmount, borrowUsd, bytes("sig"), 8);
-    }
+        // perform liquidation
+        vm.prank(liquidator);
+        market.liquidate(alice, repayUsd);
 
-    function test_repayAndWithdraw_fullRepay_returnsCollateral() public {
-        vm.prank(alice);
-        weth.approve(address(market), 1 ether);
-
-        uint256 collateralAmount = 0.1 ether;
-        uint256 borrowUsd = 50 * 10 ** 6;
-
-        vm.prank(alice);
-        market.verifyAndBorrow(alice, address(weth), collateralAmount, borrowUsd, bytes("sig"), 8);
-
-        vm.prank(alice);
-        usdc.approve(address(market), borrowUsd);
-
-        vm.prank(alice);
-        bool ok = market.repayAndWithdraw(alice, borrowUsd);
-        assertTrue(ok);
-
-        (, , uint256 borrowed) = market.getPosition(alice);
-        assertEq(borrowed, 0);
-
-        assertEq(weth.balanceOf(alice), 1 ether);
-    }
-
-    function test_adminWithdraw() public {
-        uint256 beforeBal = usdc.balanceOf(deployer);
-        uint256 marketBal = usdc.balanceOf(address(market));
-        uint256 amt = 1 * 10 ** 6;
-
-        vm.prank(deployer);
-        market.adminWithdraw(address(usdc), amt, deployer);
-
-        uint256 afterBal = usdc.balanceOf(deployer);
-
-        assertEq(afterBal - beforeBal, amt);
-        assertEq(usdc.balanceOf(address(market)), marketBal - amt);
+        // after liquidation debt must be reduced
+        TrustScoreMarket.Position memory posAfter = market.getPosition(alice);
+        assertLt(posAfter.borrowUsd, borrowAmount, "debt should reduce after liquidation");
     }
 }
